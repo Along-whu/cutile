@@ -107,10 +107,7 @@ def Fused_Compute_H_Matrix_Kernel(
     tileK: ct.Constant,
     Chunk_Size: ct.Constant
 ):
-    _, K = X.shape
     N: ct.Constant = 32
-    
-    n_routed: ct.Constant = 32
     
     block_m, block_k = ct.bid(0), ct.bid(1)
     
@@ -123,14 +120,14 @@ def Fused_Compute_H_Matrix_Kernel(
         
         x_tile = ct.load(X, (block_m, block_k * num_tileK_per_chunk + iterK), (tileM, tileK), padding_mode=ct.PaddingMode.ZERO).astype(ct.float32)
         
-        phi_tile = ct.load(phi, (block_k * num_tileK_per_chunk + iterK, 0), (tileK, n_routed), padding_mode=ct.PaddingMode.ZERO).astype(ct.float32)
+        phi_tile = ct.load(phi, (block_k * num_tileK_per_chunk + iterK, 0), (tileK, N), padding_mode=ct.PaddingMode.ZERO).astype(ct.float32)
         
-        acc_H += x_tile @ phi_tile # [tileM, tileK] @ [tileK, n_routed] -> [tileM, n_routed]
+        acc_H += x_tile @ phi_tile # [tileM, tileK] @ [tileK, N] -> [tileM, N]
         
-        square_sum_x += ct.sum(x_tile * x_tile, axis=-1, keepdims=True)
+        square_sum_x += ct.sum(x_tile * x_tile, axis=-1, keepdims=True) # [tileM, 1]
         
     ct.store(H, (block_k, block_m, 0), acc_H.reshape((1, tileM, N)).astype(H.dtype))
-    ct.store(H, (block_k, block_m, n_routed), square_sum_x.reshape((1, tileM, 1)).astype(H.dtype))
+    ct.store(H, (block_k, block_m, Stream * 2 + Stream * Stream), square_sum_x.reshape((1, tileM, 1)).astype(H.dtype))
 
 @ct.kernel
 def Split_H_Kernel(
@@ -145,7 +142,7 @@ def Split_H_Kernel(
 ):
     tileN: ct.Constant = 32
     Stream: ct.Constant = 4
-    block_m, block_k = ct.bid(0), ct.bid(1)
+    block_m = ct.bid(0)
     
     raw = ct.load(AlphaBeta, (0, ), (tileN, ), padding_mode=ct.PaddingMode.ZERO)
     
@@ -169,7 +166,7 @@ def Split_H_Kernel(
     H_res_tile = ct.extract(acc_H, (0, Stream), (tileM, Stream * Stream)).reshape((tileM, Stream, Stream))
     H_post_tile = ct.extract(acc_H, (0, Stream * Stream + Stream), (tileM, Stream))
     
-    rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, 32), (tileM, 1)) / D + 1e-9)
+    rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, Stream * Stream + 2 * Stream), (tileM, 1)) / D + 1e-9)
     
     H_pre_tile =  sigmoid_exp2(rms_norm_tile * alpha_pre * H_pre_tile + beta_pre)
     H_res_tile = ct.exp2(rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res)
@@ -207,8 +204,7 @@ def Apply_Residual_Kernel(
     
     tile_h_post = ct.load(H_post, (block_m, 0), (1, 4)).reshape((1, 4, 1))
     tile_x_pre = ct.load(X_pre, (block_m, block_k), (1, tileK)).reshape((1, 1, tileK))
-    tile_x_post = tile_h_post * tile_x_pre
-    
+    tile_x_post = tile_h_post * tile_x_pre # [1, 4, tileK] 
     
     out = tile_x_post + tile_x_res
     ct.store(O, (block_m, 0, block_k), out.astype(O.dtype))
@@ -357,9 +353,9 @@ class mHC(nn.Module):
         H = torch.matmul(X, self.phi) 
         
         # 3. 提取超参和权重
-        H_res, H_pre, H_pos = H[:, 0:16], H[:, 16:20], H[:, 20:24]
+        H_pre, H_res, H_pos = H[:, 0:4], H[:, 4:20], H[:, 20:24]
         a_res, a_pre, a_pos = self.alpha_beta[24:25], self.alpha_beta[25:26], self.alpha_beta[26:27]
-        b_res, b_pre, b_pos = self.alpha_beta[0:16], self.alpha_beta[16:20], self.alpha_beta[20:24]
+        b_pre, b_res, b_pos = self.alpha_beta[0:4], self.alpha_beta[4:20], self.alpha_beta[20:24]
         
         # 4. 【核心修改】：先缩放，再激活
         # 对于 H_pre 和 H_pos，缩放因子 inv_rmsnorm 必须在 torch.sigmoid 内部
