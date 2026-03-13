@@ -66,7 +66,7 @@ class mHC(nn.Module):
         
         return output
 
-    
+############## Cutile ######################
 import torch
 import torch.nn as nn
 import math
@@ -75,7 +75,7 @@ torch.cuda.empty_cache()
 
 print(torch.cuda.memory_summary())
 INV_LOG_2 = 1.0 / math.log(2)
-
+# num_iters = 1，kernel中无法使用for循环？？？
 def sinkhorn_knopp(x: torch.Tensor, num_iters: int=1, eps: float=1e-20) -> torch.Tensor:
     x_exp = torch.exp(x)
     
@@ -84,6 +84,9 @@ def sinkhorn_knopp(x: torch.Tensor, num_iters: int=1, eps: float=1e-20) -> torch
         x_exp = x_exp / (x_exp.sum(dim=-2, keepdim=True) + eps)
         
     return x_exp
+
+def sigmoid_exp2_(x):
+    return 1 / (1 + torch.exp2(-x))
 
 @ct.function
 def sigmoid_exp2(X: ct.Array):
@@ -137,7 +140,7 @@ def Split_H_Kernel(
     H_res: ct.Array, # [M, 4, 4]
     H_post: ct.Array, # [M, 4]
     NCHUNKS: ct.Constant,
-    D: ct.Constant,
+    K: ct.Constant,
     tileM: ct.Constant,
 ):
     tileN: ct.Constant = 32
@@ -160,20 +163,20 @@ def Split_H_Kernel(
         H_tile = ct.load(H, (i, block_m, 0), (1, tileM, tileN))
         acc_H += H_tile
     
-    acc_H = INV_LOG_2 * acc_H.reshape((tileM, tileN))
+    acc_H = acc_H.reshape((tileM, tileN))
     
     H_pre_tile =  ct.extract(acc_H, (0, 0), (tileM, Stream))
     H_res_tile = ct.extract(acc_H, (0, Stream), (tileM, Stream * Stream)).reshape((tileM, Stream, Stream))
     H_post_tile = ct.extract(acc_H, (0, Stream * Stream + Stream), (tileM, Stream))
     
-    rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, Stream * Stream + 2 * Stream), (tileM, 1)) / D + 1e-9)
+    rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, Stream * Stream + 2 * Stream), (tileM, 1)) / K + 1e-9)
     
-    H_pre_tile =  sigmoid_exp2(rms_norm_tile * alpha_pre * H_pre_tile + beta_pre)
-    H_res_tile = ct.exp2(rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res)
-    for i in range(1):
-        H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-1, keepdims=True) + 1e-20)    
-        H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-2, keepdims=True) + 1e-20)
-    H_post_tile = 2 * sigmoid_exp2(rms_norm_tile * alpha_post * H_post_tile + beta_post)
+    H_pre_tile =  sigmoid_exp2(INV_LOG_2 * (rms_norm_tile * alpha_pre * H_pre_tile + beta_pre))
+    H_res_tile = ct.exp2(INV_LOG_2 * (rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res))
+    # for i in range(1):
+    H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-1, keepdims=True) + 1e-20)    
+    H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-2, keepdims=True) + 1e-20)
+    H_post_tile = 2.0 * sigmoid_exp2(INV_LOG_2 * (rms_norm_tile * alpha_post * H_post_tile + beta_post))
     
     ct.store(H_pre, (block_m, 0), H_pre_tile.astype(H_pre.dtype), allow_tma=False)
     ct.store(H_res, (block_m, 0, 0), H_res_tile.astype(H_res.dtype), allow_tma=False)
@@ -259,12 +262,12 @@ def Split_H(H, X, alpha_beta, tileM: int=128, stream: int=4, tileK: int=1024):
         torch.cuda.current_stream(),
         grid,
         Split_H_Kernel,
-        (H, alpha_beta, H_pre, H_res, H_post, n_chunks, K // stream, tileM)
+        (H, alpha_beta, H_pre, H_res, H_post, n_chunks, K, tileM)
     )
     
     return H_pre, H_res, H_post
 
-def Apply_Residual(X, H_res, X_pre, H_post, tileM: int=128, tileK: int=256):
+def Apply_Residual(X, H_res, X_pre, H_post, tileM: int=1, tileK: int=256):
     # X: [M, K]
     # H_res: [M, 4, 4]
     # X_pre: [M, K // 4]
@@ -277,7 +280,7 @@ def Apply_Residual(X, H_res, X_pre, H_post, tileM: int=128, tileK: int=256):
     
     O =  torch.empty([M , Stream, K // 4], dtype=X.dtype, device=X.device)
 
-    grid = (M, ct.cdiv(D, tileK))
+    grid = (ct.cdiv(M, tileM), ct.cdiv(D, tileK))
     ct.launch(
         torch.cuda.current_stream(),
         grid,
@@ -286,7 +289,7 @@ def Apply_Residual(X, H_res, X_pre, H_post, tileM: int=128, tileK: int=256):
     )
     return O.view(M, -1)
     
-def Apply_Pre_Transformer(X: torch.Tensor, H_pre: torch.Tensor, tile_size: int=256):
+def Apply_Pre_Transformer(X: torch.Tensor, H_pre: torch.Tensor, tile_M: int=1, tileK: int=256):
     M, K = X.shape
     assert K % 4 == 0
     Y = torch.empty(size=[M, K // 4], device=X.device, dtype=X.dtype)
@@ -296,9 +299,9 @@ def Apply_Pre_Transformer(X: torch.Tensor, H_pre: torch.Tensor, tile_size: int=2
     # O: [M, K // 4] = H_pre[block_m, 4]  X[block_m, 4, block_y] 
     ct.launch(
         torch.cuda.current_stream(), 
-        (M, ct.cdiv(K // 4, tile_size)),
+        (ct.cdiv(M, tile_M), ct.cdiv(K // 4, tileK)),
         ApplyPreTransform_Kernel,
-        (X.view(M, 4, K // 4), H_pre, Y, tile_size)
+        (X.view(M, 4, K // 4), H_pre, Y, tileK)
     )
     return Y
 
@@ -337,7 +340,7 @@ class mHC(nn.Module):
         out = Apply_Residual(x, H_res, X_pre, H_post)
         print("Apply_Residual Pass!")
         
-        return out
+        return H_pre, H_res, H_post, out
     
     def reference_logic(self, X: torch.Tensor):
 
@@ -346,15 +349,16 @@ class mHC(nn.Module):
         
         # 1. 计算 RMSNorm 的缩放因子 (注意保持维度以便广播)
         # rmsnorm 形状应为 [M, 1]
-        rmsnorm = (X.norm(dim=-1, keepdim=True) / math.sqrt(K)) + 1e-9
-        inv_rmsnorm = 1.0 / rmsnorm
+        eps = 1e-9
+        rms = torch.sqrt(torch.mean(X * X, dim=-1, keepdim=True) + eps)
+        inv_rmsnorm = 1.0 / rms
 
         # 2. 线性投影
         H = torch.matmul(X, self.phi) 
         
         # 3. 提取超参和权重
         H_pre, H_res, H_pos = H[:, 0:4], H[:, 4:20], H[:, 20:24]
-        a_res, a_pre, a_pos = self.alpha_beta[24:25], self.alpha_beta[25:26], self.alpha_beta[26:27]
+        a_pre, a_res, a_pos = self.alpha_beta[24:25], self.alpha_beta[25:26], self.alpha_beta[26:27]
         b_pre, b_res, b_pos = self.alpha_beta[0:4], self.alpha_beta[4:20], self.alpha_beta[20:24]
         
         # 4. 【核心修改】：先缩放，再激活
@@ -384,10 +388,14 @@ class mHC(nn.Module):
         
         # 7. 合并输出
         out = X_pos_out + X_res_out
-        return out.view(M, K)
+        return H_pre.view(M, 4), H_res, H_pos.view(M, 4), out.view(M, K)
     
-MHC = mHC(dim=256, n=4).to(device="cuda")
-X = torch.randn(size=[256, 256*4], device="cuda", dtype=torch.float32)
-pred = MHC(X)
-real = MHC.reference_logic(X)
-print(pred - real)
+MHC = mHC(dim=1024, n=4).to(device="cuda")
+X = torch.randn(size=[1024, 1024*4], device="cuda", dtype=torch.float32)
+H_pre_k, H_res_k, H_post_k, out_k = MHC(X)
+H_pre_r, H_res_r, H_post_r, out_r = MHC.reference_logic(X)
+
+print(f"H_pre Error : {torch.abs(H_pre_k - H_pre_r)}")
+print(f"H_res Error : {torch.abs(H_res_k - H_res_r)}")
+print(f"H_post Error: {torch.abs(H_post_k - H_post_r)}")
+print(f"OUT Error   : {torch.abs(out_k - out_r)}")
