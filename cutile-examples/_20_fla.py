@@ -45,12 +45,17 @@ def chunk_fwd_h_kernel(
         num_seq_blocks = ct.cdiv(seq_len, TILE_T) # number of sequence blocks for this sequence
         num_states = ct.cdiv(seq_len, TILE_S) # number of states for this sequence
         num_seq_per_state = ct.cdiv(num_seq_blocks, num_states) # number of sequence blocks that contribute to each state
+        states_start_idx = ct.load(split_offsets, (block_b_idx, ), (1, )) # the starting state index for this sequence
     else:
         num_seq_blocks = ct.cdiv(NUM_SEQS, TILE_T)
         num_states = ct.cdiv(NUM_SEQS, TILE_S)
         num_seq_per_state = ct.cdiv(num_seq_blocks, num_states)
         
     acc = ct.zeros((TILE_K, TILE_V), dtype=ct.float32)
+    
+    if USE_G_GAMMA:
+        g_gamma_h = ct.load(g_gamma, (block_h_idx, ), (1, )).astype(ct.float32)
+        g_gamma_chunk = g_gamma_h * (ct.arange(0, TILE_T) + 1)
     
     if USE_INITIAL_STATE:
         tile_h0 = ct.load(h0, (block_b_idx, block_h_idx, 0, 0), (1, 1, HEAD_DIM_K, HEAD_DIM_V), padding_mode=ct.PADDING_MODE.ZERO)
@@ -67,30 +72,78 @@ def chunk_fwd_h_kernel(
         
         # Assume we have 8 tokens, and TILE_T = 2, TILE_S = 4, then 
         if block_seq_idx % num_seq_per_state == 0:
-            ct.store(h, (block_b_idx, states_idx, block_h_idx, block_k_idx, block_v_idx), acc.reshape((1, 1, 1, TILE_K, TILE_V)).astype(h.dtype))
+            if IS_VARLEN:
+                ct.store(h, (states_start_idx + states_idx, block_h_idx, block_k_idx, block_v_idx), acc.reshape((1, 1, TILE_K, TILE_V)).astype(h.dtype))
+            else:
+                ct.store(h, (block_b_idx, states_idx, block_h_idx, block_k_idx, block_v_idx), acc.reshape((1, 1, 1, TILE_K, TILE_V)).astype(h.dtype))
+        
+        last_token_idx = ct.min((block_seq_idx + 1) * TILE_T, seq_len) - 1
         
         if USE_G:
-            last_token_idx = ct.min((block_seq_idx + 1) * TILE_T, seq_len) - 1
             g_end = ct.load(g, (block_b_idx, last_token_idx, block_h_idx), (1, 1, 1), padding_mode=ct.PADDING_MODE.ZERO)
             g_end = g_end.reshape((1, 1)).astype(ct.float32)
             
             g_chunk = ct.load(g, (block_b_idx, block_seq_idx, block_h_idx), (1, TILE_T, 1), padding_mode=ct.PADDING_MODE.ZERO)
             g_chunk = g_chunk.reshape((TILE_T, 1)).astype(ct.float32)
             
-            g_chunk = ct.exp(g_chunk - g_end) # [TILE_T, 1]
-            tileV = tileV * g_chunk # [TILE_T, TILE_V]
+            tileV = tileV * ct.exp(g_end - g_chunk) # [TILE_T, TILE_V]
             acc *= ct.exp(g_end) # [TILE_K, TILE_V]
         
         if USE_G_GAMMA:
+            g_gamma_end = g_gamma_h * ct.min((seq_end - TILE_T * block_seq_idx), TILE_T)
+            acc *= ct.exp(g_gamma_end)
+            tileV = tileV * ct.exp((g_gamma_end - g_gamma_chunk).reshape((TILE_T, 1)))
             
+        if USE_GK:
+            gk_end = ct.load(gk, (block_b_idx, last_token_idx, block_h_idx, block_k_idx), (1, 1, 1, TILE_K), padding_mode=ct.PADDING_MODE.ZERO)
+            gk_end = gk_end.reshape((1, TILE_K)).astype(ct.float32)
             
+            gk_chunk = ct.load(gk, (block_b_idx, block_seq_idx, block_h_idx, block_k_idx), (1, TILE_T, 1, TILE_K), padding_mode=ct.PADDING_MODE.ZERO)
+            gk_chunk = gk_chunk.reshape((TILE_T, TILE_K)).astype(ct.float32)
+            
+            acc *= ct.exp(gk_end) # [TILE_K, TILE_V]
+            tileK = tileK * ct.exp(gk_end - gk_chunk) # [TILE_T, TILE_K]
         
+        if  USE_GV:
+            gv_end = ct.load(gv, (block_b_idx, last_token_idx, block_h_idx, block_v_idx), (1, 1, 1, TILE_V), padding_mode=ct.PADDING_MODE.ZERO)
+            gv_end = gv_end.reshape((1, TILE_V)).astype(ct.float32)
+            
+            gv_chunk = ct.load(gv, (block_b_idx, block_seq_idx, block_h_idx, block_v_idx), (1, TILE_T, 1, TILE_V), padding_mode=ct.PADDING_MODE.ZERO)
+            gv_chunk = gv_chunk.reshape((TILE_T, TILE_V)).astype(ct.float32)
+            
+            acc *= ct.exp(gv_end) # [TILE_K, TILE_V]
+            tileV = tileV * ct.exp(gv_end - gv_chunk) # [TILE_T, TILE_V]
         
+        acc = ct.mma(tileK.transpose(-1, -2), tileV, acc)
         
+    if STORE_FINAL_STATE:
+        ct.store(ht, (block_b_idx, block_h_idx, block_k_idx, block_v_idx), acc.reshape((1, 1, TILE_K, TILE_V)).astype(ht.dtype))
+        
+def chunk_fwd_o(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+    use_exp2: bool = False,
+    transpose_state_layout: bool = False,
+):
+    """
+    q: [bs, seq_len, num_heads, head_dim_q]
+    k: [bs, seq_len, num_heads, head_dim_k]
+    v: [bs, seq_len, num_heads, head_dim_v]
+    h: [bs, num_states, num_heads, head_dim_k, head_dim_v] or [num_states, num_heads, head_dim_k, head_dim_v]
+    g: [bs, seq_len, num_heads] or None
+    g_gamma: [num_heads] or None
+    cu_seqlens: [bs + 1] or None
+    """
     
-    
-    
-
+        
 def chunk_fwd_h(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -140,8 +193,15 @@ def chunk_fwd_h(
     
     grid = (ct.cdiv(head_dim_k, tileK), ct.cdiv(head_dim_v, tileV), num_seqs * num_heads)
     
-    ct.launch(torch.cuda.current_stream(), grid, )
-        
+    ct.launch(torch.cuda.current_stream(), grid, chunk_fwd_h_kernel, 
+              (
+                  k, v, h, g, g_gamma, gk, gv, h0, ht, cu_seqlens, split_offsets,
+                  seq_len, num_heads, head_dim_k, head_dim_v, tileT, tileS,
+                  g is not None, g_gamma is not None, gk is not None, gv is not None, h0 is not None, ht is not None, cu_seqlens is not None
+              )
+              )
+    return h, ht
+    
 
 def FlashLinearAttention(
     q: torch.Tensor,
@@ -156,6 +216,8 @@ def FlashLinearAttention(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ):
+    # h: [bs, num_states, num_heads, head_dim_k, head_dim_v]
+    # ht: [num_seqs, num_heads, head_dim_k, head_dim_v]
     h, ht = chunk_fwd_h(
         k=k,
         v=v,
@@ -168,4 +230,17 @@ def FlashLinearAttention(
         states_in_fp32=False,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+    )
+    
+    o = chunk_fwd_o(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        g_gamma=g_gamma,
+        h=h,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
     )
