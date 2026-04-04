@@ -3,68 +3,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-def sinkhorn_knopp(x: torch.Tensor, num_iters: int=1, eps: float=1e-20) -> torch.Tensor:
-    x_exp = torch.exp(x)
+# def sinkhorn_knopp(x: torch.Tensor, num_iters: int=20, eps: float=1e-20) -> torch.Tensor:
+#     x_exp = torch.exp(x)
     
-    for i in range(num_iters):
-        x_exp = x_exp / (x_exp.sum(dim=-1, keepdim=True) + eps)    
-        x_exp = x_exp / (x_exp.sum(dim=-2, keepdim=True) + eps)
+#     for i in range(num_iters):
+#         x_exp = x_exp / (x_exp.sum(dim=-1, keepdim=True) + eps)    
+#         x_exp = x_exp / (x_exp.sum(dim=-2, keepdim=True) + eps)
         
-    return x_exp
+#     return x_exp
         
     
 
-class mHC(nn.Module):
-    def __init__(self, dim, n):
-        super().__init__()
-        self.dim = dim
-        self.n = n
-        self.nc = n * dim
-        self.n2 = n * n
+# class mHC(nn.Module):
+#     def __init__(self, dim, n):
+#         super().__init__()
+#         self.dim = dim
+#         self.n = n
+#         self.nc = n * dim
+#         self.n2 = n * n
         
-        self.phi = nn.Linear(self.nc, self.n2 + 2 * self.n, bias=False)
+#         self.phi = nn.Linear(self.nc, self.n2 + 2 * self.n, bias=False)
         
-        self.alpha = nn.Parameter(torch.ones((3, )) * 0.01)
-        self.b = nn.Parameter(torch.zeros((self.n2 + 2 * self.n)))
+#         self.alpha = nn.Parameter(torch.ones((3, )) * 0.01)
+#         self.b = nn.Parameter(torch.zeros((self.n2 + 2 * self.n)))
     
-    def width_connection(self, hidden_states):
-        # hidden_states: [B, L, n, dim]
-        B, L, L, D = hidden_states.shape
+#     def width_connection(self, hidden_states):
+#         # hidden_states: [B, L, n, dim]
+#         B, L, L, D = hidden_states.shape
         
-        hidden_states_flat = hidden_states.flatten(2) # [B, L ,n*dim]
+#         hidden_states_flat = hidden_states.flatten(2) # [B, L ,n*dim]
         
-        """
-        RMSNorm(x): gamma * x / rms(x)
-        H = phi * RMSNorm(x) = phi * gamma * x / rms(x)
-        gamma参数可以吸收进phi中，只需要计算rms(x)
-        """
-        r = hidden_states_flat.norm(dim=-1, keepdim=True) / math.sqrt(self.nc)
+#         """
+#         RMSNorm(x): gamma * x / rms(x)
+#         H = phi * RMSNorm(x) = phi * gamma * x / rms(x)
+#         gamma参数可以吸收进phi中，只需要计算rms(x)
+#         """
+#         r = hidden_states_flat.norm(dim=-1, keepdim=True) / math.sqrt(self.nc)
         
-        H = self.phi(hidden_states) # [B, L, n2 + 2 * n]
+#         H = self.phi(hidden_states) # [B, L, n2 + 2 * n]
         
-        H_pre = 1 / r * self.alpha[0] * H[:, :, :self.n] + self.b[:self.n] # [B, L, n]
-        H_post = 1 / r * self.alpha[1] * H[:, :, self.n:2*self.n] + self.b[self.n:2*self.n] # [B, L, n]
-        H_res = 1 / r * self.alpha[2] * H[:, :, 2*self.n:] + self.b[2*self.n:] # [B, L, n*n]
+#         H_pre = 1 / r * self.alpha[0] * H[:, :, :self.n] + self.b[:self.n] # [B, L, n]
+#         H_post = 1 / r * self.alpha[1] * H[:, :, self.n:2*self.n] + self.b[self.n:2*self.n] # [B, L, n]
+#         H_res = 1 / r * self.alpha[2] * H[:, :, 2*self.n:] + self.b[2*self.n:] # [B, L, n*n]
         
-        H_pre = F.sigmoid(H_pre)
-        H_post = 2 * F.sigmoid(H_post)
+#         H_pre = F.sigmoid(H_pre)
+#         H_post = 2 * F.sigmoid(H_post)
         
-        H_res = H_res.reshape(B, L, self.n, self.n) # [B, L, n, n]
-        H_res = sinkhorn_knopp(H_res)
+#         H_res = H_res.reshape(B, L, self.n, self.n) # [B, L, n, n]
+#         H_res = sinkhorn_knopp(H_res)
         
-        h_pre = H_pre.unsqueeze(2) @ hidden_states # [B, L, 1, dim]
-        h_res = H_res @ hidden_states # [B, L, n, dim]
+#         h_pre = H_pre.unsqueeze(2) @ hidden_states # [B, L, 1, dim]
+#         h_res = H_res @ hidden_states # [B, L, n, dim]
         
-        return h_pre, h_res, H_post
+#         return h_pre, h_res, H_post
     
-    def depth_connection(self, h_res, hidden_states, H_post):
-        # h_res: [B, L, n, dim] 
-        # hidden_states: [B, L, dim] 
-        # H_post: [B, L, n]
-        h_post = H_post.unsqueeze(-1) @ hidden_states.unsqueeze(-2) # [B, L, n, dim]
-        output = h_post + h_res
+#     def depth_connection(self, h_res, hidden_states, H_post):
+#         # h_res: [B, L, n, dim] 
+#         # hidden_states: [B, L, dim] 
+#         # H_post: [B, L, n]
+#         h_post = H_post.unsqueeze(-1) @ hidden_states.unsqueeze(-2) # [B, L, n, dim]
+#         output = h_post + h_res
         
-        return output
+#         return output
 
 ############## Cutile ######################
 import torch
@@ -76,7 +76,7 @@ torch.cuda.empty_cache()
 print(torch.cuda.memory_summary())
 INV_LOG_2 = 1.0 / math.log(2)
 # num_iters = 1，kernel中无法使用for循环？？？
-def sinkhorn_knopp(x: torch.Tensor, num_iters: int=1, eps: float=1e-20) -> torch.Tensor:
+def sinkhorn_knopp(x: torch.Tensor, num_iters: int=20, eps: float=1e-20) -> torch.Tensor:
     x_exp = torch.exp(x)
     
     for i in range(num_iters):
@@ -162,7 +162,6 @@ def Split_H_Kernel(
     for i in range(NCHUNKS):
         H_tile = ct.load(H, (i, block_m, 0), (1, tileM, tileN))
         acc_H += H_tile
-    
     acc_H = acc_H.reshape((tileM, tileN))
     
     H_pre_tile =  ct.extract(acc_H, (0, 0), (tileM, Stream))
@@ -172,12 +171,14 @@ def Split_H_Kernel(
     rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, Stream * Stream + 2 * Stream), (tileM, 1)) / K + 1e-9)
     
     H_pre_tile =  sigmoid_exp2(INV_LOG_2 * (rms_norm_tile * alpha_pre * H_pre_tile + beta_pre))
-    H_res_tile = ct.exp2(INV_LOG_2 * (rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res))
-    # for i in range(1):
-    H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-1, keepdims=True) + 1e-20)    
-    H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-2, keepdims=True) + 1e-20)
+    # We save the log of H_res, and apply sinkhorn in another kernel to avoid numerical instability
+    H_res_tile = (rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res)
+    # H_res_tile = ct.exp2(INV_LOG_2 * (rms_norm_tile.reshape((tileM, 1, 1)) * alpha_res * H_res_tile + beta_res))
+        
+    # # for i in range(1):
+    # H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-1, keepdims=True) + 1e-20)    
+    # H_res_tile = H_res_tile / (ct.sum(H_res_tile, axis=-2, keepdims=True) + 1e-20)
     H_post_tile = 2.0 * sigmoid_exp2(INV_LOG_2 * (rms_norm_tile * alpha_post * H_post_tile + beta_post))
-    
     ct.store(H_pre, (block_m, 0), H_pre_tile.astype(H_pre.dtype), allow_tma=False)
     ct.store(H_res, (block_m, 0, 0), H_res_tile.astype(H_res.dtype), allow_tma=False)
     ct.store(H_post, (block_m, 0), H_post_tile.astype(H_post.dtype), allow_tma=False)
@@ -227,7 +228,32 @@ def ApplyPreTransform_Kernel(
     tile_y = ct.sum(tile_h * tile_x, axis=1).reshape((1, tile_size))
     ct.store(O, (block_m, block_y), tile_y.astype(O.dtype), allow_tma=False)
 
-  
+@ct.kernel
+def Sinkhorn_Exp2_Kernel(
+    H_res: ct.Array, # [M, 4, 4] log of H_res
+    NUM_ITERS: ct.Constant=20,
+    EPS: ct.Constant=1e-20
+):
+    block_m = ct.bid(0)
+    
+    H_res_tile = ct.load(H_res, (block_m, 0, 0), (1, 4, 4))
+    H_res_tile = H_res_tile.reshape((4, 4))
+    H_res_tile *= INV_LOG_2
+    
+    for i in range(NUM_ITERS):
+        row_max = ct.max(H_res_tile, axis=-1, keepdims=True)
+        row_lse = row_max + ct.log2(ct.sum(ct.exp2(H_res_tile - row_max), axis=-1, keepdims=True) + EPS)
+        H_res_tile = H_res_tile - row_lse
+        
+        col_max = ct.max(H_res_tile, axis=-2, keepdims=True)
+        col_lse = col_max + ct.log2(ct.sum(ct.exp2(H_res_tile - col_max), axis=-2, keepdims=True) + EPS)
+        H_res_tile = H_res_tile - col_lse
+    
+    final_H = ct.exp2(H_res_tile)
+    final_H = final_H.reshape((1, 4, 4))
+    ct.store(H_res, (block_m, 0, 0), final_H.astype(H_res.dtype))
+        
+
 def Compute_H_RmsNorm(x, phi, n_stream: int=4, chunk_size: int=512, tileM: int=128, tileK: int=128):
     M, K = x.shape
     K, N = phi.shape
@@ -265,7 +291,15 @@ def Split_H(H, X, alpha_beta, tileM: int=128, stream: int=4, tileK: int=1024):
         (H, alpha_beta, H_pre, H_res, H_post, n_chunks, K, tileM)
     )
     
-    return H_pre, H_res, H_post
+    # sinkhorn kernel
+    ct.launch(
+        torch.cuda.current_stream(),
+        (M, ),
+        Sinkhorn_Exp2_Kernel,
+        (H_res, 20, 1e-20)
+    )
+    
+    return H_pre, H_res, H_post,
 
 def Apply_Residual(X, H_res, X_pre, H_post, tileM: int=1, tileK: int=256):
     # X: [M, K]
@@ -392,7 +426,7 @@ class mHC(nn.Module):
     
 MHC = mHC(dim=1024, n=4).to(device="cuda")
 X = torch.randn(size=[1024, 1024*4], device="cuda", dtype=torch.float32)
-H_pre_k, H_res_k, H_post_k, out_k = MHC(X)
+H_pre_k, H_res_k, H_post_k, out_k= MHC(X)
 H_pre_r, H_res_r, H_post_r, out_r = MHC.reference_logic(X)
 
 print(f"H_pre Error : {torch.abs(H_pre_k - H_pre_r)}")
